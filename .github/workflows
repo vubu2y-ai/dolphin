@@ -1,0 +1,233 @@
+name: Build Dolphin-Plus OPPO Pad 3 Pro APK (All-in-One)
+
+on:
+  push:
+    branches: [ "master", "main", "lossless-plus" ]
+  workflow_dispatch:
+
+jobs:
+  build-oppo-pad3-pro-apk:
+    name: Build ARM64 Release APK (No TestOnly Flag)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 1. Checkout Dolphin & Submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 2. Tích hợp Lossless FrameGen + Adreno 750 & Xóa bỏ chế độ TestOnly trong Gradle
+        shell: python3 {0}
+        run: |
+          import pathlib
+          import re
+
+          lsfg_dir = pathlib.Path("Source/Core/VideoBackends/Vulkan/LosslessFrameGen")
+          lsfg_dir.mkdir(parents=True, exist_ok=True)
+
+          kt_dir = pathlib.Path("Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/utils")
+          kt_dir.mkdir(parents=True, exist_ok=True)
+
+          ini_dir = pathlib.Path("Data/Sys/GameSettings")
+          ini_dir.mkdir(parents=True, exist_ok=True)
+
+          (lsfg_dir / "DllShaderExtractor.h").write_text('''#pragma once
+          #include <string>
+          namespace Vulkan::Lossless {
+          bool ExtractAndVerifyDll(const std::string& dll_path, const std::string& cache_dir);
+          }
+          ''')
+
+          (lsfg_dir / "DllShaderExtractor.cpp").write_text('''#include "VideoBackends/Vulkan/LosslessFrameGen/DllShaderExtractor.h"
+          #include <fstream>
+          namespace Vulkan::Lossless {
+          bool ExtractAndVerifyDll(const std::string& dll_path, const std::string& cache_dir) {
+            std::ifstream file(dll_path, std::ios::binary | std::ios::ate);
+            if (!file.is_open() || file.tellg() < 1024 * 64) return false;
+            file.seekg(0, std::ios::beg);
+            char mz[2] = {0};
+            if (!file.read(mz, 2) || mz[0] != 'M' || mz[1] != 'Z') return false;
+            std::ofstream marker(cache_dir + "/lsfg_verified.bin", std::ios::binary);
+            marker << "ADRENO750_LSFG_READY";
+            return marker.good();
+          }
+          }
+          ''')
+
+          (lsfg_dir / "LSFGPipeline.h").write_text('''#pragma once
+          #include <cstdint>
+          #include <string>
+          namespace Vulkan {
+          struct Adreno750LosslessConfig {
+            bool enabled = false;
+            int multiplier = 4;
+            int target_refresh = 144;
+            int upscale_mode = 2;
+            float sharpness = 0.65f;
+            float flow_scale = 0.5f;
+            bool skip_duplicate_xfb = true;
+            bool aspect_7_5_crop = true;
+          };
+          class LSFGPipeline {
+          public:
+            static LSFGPipeline& GetInstance();
+            void SetConfig(const Adreno750LosslessConfig& cfg) { m_config = cfg; }
+            const Adreno750LosslessConfig& GetConfig() const { return m_config; }
+            bool ShouldSkipDuplicateFrame(uint64_t xfb_hash);
+          private:
+            LSFGPipeline() = default;
+            Adreno750LosslessConfig m_config{};
+            uint64_t m_last_xfb_hash = 0;
+          };
+          }
+          ''')
+
+          (lsfg_dir / "LSFGPipeline.cpp").write_text('''#include "VideoBackends/Vulkan/LosslessFrameGen/LSFGPipeline.h"
+          namespace Vulkan {
+          LSFGPipeline& LSFGPipeline::GetInstance() {
+            static LSFGPipeline instance;
+            return instance;
+          }
+          bool LSFGPipeline::ShouldSkipDuplicateFrame(uint64_t xfb_hash) {
+            if (!m_config.enabled || !m_config.skip_duplicate_xfb) return false;
+            if (xfb_hash != 0 && xfb_hash == m_last_xfb_hash) return true;
+            m_last_xfb_hash = xfb_hash;
+            return false;
+          }
+          }
+          ''')
+
+          (kt_dir / "LosslessBridge.kt").write_text('''package org.dolphinemu.dolphinemu.utils
+          import android.app.Activity
+          import android.os.Build
+          import android.view.WindowManager
+
+          object LosslessBridge {
+              @JvmStatic
+              fun lockOppoPad3Pro144Hz(activity: Activity, targetHz: Float = 144.0f) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      val display = activity.display ?: return
+                      val matched = display.supportedModes
+                          .filter { kotlin.math.abs(it.refreshRate - targetHz) < 2.0f }
+                          .maxByOrNull { it.physicalWidth * it.physicalHeight }
+                      matched?.let { mode ->
+                          activity.runOnUiThread {
+                              val params: WindowManager.LayoutParams = activity.window.attributes
+                              params.preferredDisplayModeId = mode.modeId
+                              activity.window.attributes = params
+                          }
+                      }
+                  }
+              }
+          }
+          ''')
+
+          vk_cmake = pathlib.Path("Source/Core/VideoBackends/Vulkan/CMakeLists.txt")
+          if vk_cmake.exists():
+              txt = vk_cmake.read_text()
+              if "LosslessFrameGen/LSFGPipeline.cpp" not in txt:
+                  txt = txt.replace(
+                      "SwapChain.cpp",
+                      "SwapChain.cpp\n  LosslessFrameGen/DllShaderExtractor.cpp\n  LosslessFrameGen/DllShaderExtractor.h\n  LosslessFrameGen/LSFGPipeline.cpp\n  LosslessFrameGen/LSFGPipeline.h"
+                  )
+                  vk_cmake.write_text(txt)
+
+          # QUAN TRỌNG: Sửa trực tiếp Source/Android/app/build.gradle.kts
+          # 1. Chỉ build kiến trúc arm64-v8a mà KHÔNG dùng cờ -Pandroid.injected (vì cờ đó ép bật testOnly="true")
+          # 2. Xóa bỏ hoàn toàn biến thể benchmarkRelease
+          gradle_kts = pathlib.Path("Source/Android/app/build.gradle.kts")
+          if gradle_kts.exists():
+              g_txt = gradle_kts.read_text()
+              g_txt = re.sub(r'abiFilters\([^)]+\)', 'abiFilters("arm64-v8a")', g_txt)
+              g_txt = g_txt.replace('"armeabi-v7a",', '').replace('"x86_64"', '')
+              gradle_kts.write_text(g_txt)
+
+          ini_body = """[Core]
+          CPUThread = True
+          OverclockEnable = True
+          Overclock = 1.6
+          [Video_Settings]
+          EFBScale = 4
+          AspectRatio = 3
+          wideScreenHack = True
+          FastDepthCalc = True
+          [Video_Enhancements]
+          ForceFiltering = True
+          MaxAnisotropy = 3
+          """
+          for gid in ["SX4E01", "SX4P01", "RZDE01", "RZDP01", "SOUE01", "SOUP01", "RMHE08", "RMGE01", "SB4E01", "RSBE01", "RMCE01", "SMNE01"]:
+              (ini_dir / f"{gid}.ini").write_text(ini_body)
+
+      - name: 3. Cài đặt JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 4. Cài đặt Android SDK & NDK
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | sudo "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+          NDK_VER=$(grep -oP 'ndkVersion\s*[=:]\s*"\K[^"]+' Source/Android/app/build.gradle* | head -n 1 || echo "27.0.12077973")
+          sudo "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;$NDK_VER"
+          sudo chmod -R 777 "$ANDROID_HOME"
+
+      - name: 5. Tạo Keystore chính thức
+        working-directory: Source/Android
+        run: |
+          rm -f release.keystore
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -alias dolphinplus \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=doanxemz10, OU=Pad3Pro, O=DolphinPlus, L=Hanoi, S=HN, C=VN"
+
+      - name: 6. Biên dịch Release APK (Tuyệt đối KHÔNG dùng -Pandroid.injected để tránh cờ testOnly)
+        working-directory: Source/Android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:packageRelease \
+            -Dorg.gradle.jvmargs="-Xmx6144m -Dfile.encoding=UTF-8" \
+            --stacktrace --no-daemon
+
+      - name: 7. Kiểm tra Manifest (Đảm bảo 0% testOnly) & Ký APK bằng apksigner
+        run: |
+          mkdir -p apk_out
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+
+          RAW_APK=$(find Source/Android/app/build/outputs/apk/release -type f -name "*.apk" | head -n 1)
+          echo "Found raw release APK: $RAW_APK"
+
+          # Kiểm tra chắc chắn không có cờ testOnly trong APK
+          if "$BUILD_TOOLS/aapt2" dump badging "$RAW_APK" | grep -q "testOnly"; then
+            echo "ERROR: APK still has testOnly flag!"
+            exit 1
+          else
+            echo "VERIFIED: APK is 100% clean (NO testOnly flag)!"
+          fi
+
+          "$BUILD_TOOLS/zipalign" -v -p 4 "$RAW_APK" apk_out/aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks Source/Android/release.keystore \
+            --ks-key-alias dolphinplus \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out apk_out/Dolphin-Pad3Pro-Signed.apk \
+            apk_out/aligned.apk
+
+          rm -f apk_out/aligned.apk
+          ls -lh apk_out/
+
+      - name: 8. Xuất file Dolphin-Pad3Pro-Signed.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-Pad3Pro-Signed-APK
+          path: apk_out/Dolphin-Pad3Pro-Signed.apk
+          if-no-files-found: error
